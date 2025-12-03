@@ -1,15 +1,11 @@
 import socket
-
-def start_client():
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.connect(("localhost", 12345))
-
-    client.sendall(b"Hello world!")
-
-    response = client.recv(1024)
-    print(f"Server response: {response.decode()}")
-
-    client.close()
-
-if __name__ == "__main__":
-    start_client()
+# Создаем сокет
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# Подключаемся к серверу
+client_socket.connect(('localhost', 12345))
+# Отправляем данные серверу
+client_socket.sendall(b'Hello, server!')
+data = client_socket.recv(1024)  # Ждем ответ
+print(f"Получен ответ: {data}")
+# Закрываем соединение
+client_socket.close()
