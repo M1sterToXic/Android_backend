@@ -1,20 +1,18 @@
 import socket
-
-def start_server():
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("localhost", 12345))
-    server.listen(1)
-    print("Server started on port 12345")
-
-    conn, addr = server.accept()
-    print(f"Connect by {addr}")
-
-    data = conn.recv(1024)
-    print(f"Received: {data.decode()}")
-
-    conn.sendall(b"Hello Server")
-    conn.close()
-    server.close()
-
-if __name__ == "__main__":
-    start_server()
+# Создаем сокет
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+# Привязываем сокет к IP-адресу и порту
+server_socket.bind(('localhost', 12345))
+# Слушаем входящие соединения
+server_socket.listen(1)
+print("Сервер запущен и ожидает подключений...")
+# Принимаем входящее соединение
+client_socket, client_address = server_socket.accept()
+print(f"Подключение установлено с {client_address}")
+# Получаем данные от клиента
+data = client_socket.recv(1024)
+print(f"Получены данные: {data}")
+client_socket.sendall(b'Hello from Python server!')
+# Закрываем соединения
+client_socket.close()
+server_socket.close()
