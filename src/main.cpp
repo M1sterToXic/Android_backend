@@ -51,79 +51,85 @@ struct LocationData {
 
 LocationData g_locationData;
 
-void saveToJsonFile(const LocationData& data, int counter) {
-    try {
-        json j;
-        j["counter"] = counter;
-        j["latitude"] = data.latitude;
-        j["longitude"] = data.longitude;
-        j["altitude"] = data.altitude;
-        j["accuracy"] = data.accuracy;
-        j["time"] = data.time;
-        j["time_milliseconds"] = data.time_milliseconds;
+void saveToJsonFile(const LocationData& data) {
+    const std::string filename = "location_history.json";
+    json root;
 
-        json traffic;
-        traffic["total_rx"] = data.traffic.total_rx;
-        traffic["total_tx"] = data.traffic.total_tx;
-        traffic["total"] = data.traffic.total;
-        j["traffic"] = traffic;
-
-        json cells = json::array();
-        for (const auto& cell : data.cellTowers) {
-            json cellJson;
-            cellJson["type"] = cell.type;
-            cellJson["mcc"] = cell.mcc;
-            cellJson["mnc"] = cell.mnc;
-            cellJson["pci"] = cell.pci;
-            cellJson["tac"] = cell.tac;
-            cellJson["timing_advance"] = cell.timing_advance;
-
-            if (cell.type == "LTE") {
-                cellJson["band"] = cell.band;
-                cellJson["cell_identity"] = cell.cell_identity;
-                cellJson["earfcn"] = cell.earfcn;
-                cellJson["asu_level"] = cell.asu_level;
-                cellJson["cqi"] = cell.cqi;
-                cellJson["rsrp"] = cell.rsrp;
-                cellJson["rsrq"] = cell.rsrq;
-                cellJson["rssi"] = cell.rssi;
-                cellJson["rssnr"] = cell.rssnr;
-            } else if (cell.type == "GSM") {
-                cellJson["bsic"] = cell.bsic;
-                cellJson["arfcn"] = cell.arfcn;
-                cellJson["lac"] = cell.lac;
-                cellJson["dbm"] = cell.dbm;
-            } else if (cell.type == "NR") {
-                cellJson["nci"] = cell.nci;
-                cellJson["nrarfcn"] = cell.nrarfcn;
-                cellJson["ss_rsrp"] = cell.ss_rsrp;
-                cellJson["ss_rsrq"] = cell.ss_rsrq;
-                cellJson["ss_sinr"] = cell.ss_sinr;
-                cellJson["timing_advance_micros"] = cell.timing_advance_micros;
+    std::ifstream inputFile(filename);
+    if (inputFile.good()) {
+        try {
+            inputFile >> root;
+            inputFile.close();
+            if (!root.contains("locations") || !root["locations"].is_array()) {
+                root = json::object();
+                root["locations"] = json::array();
             }
-            cells.push_back(cellJson);
+        } catch (...) {
+            root = json::object();
+            root["locations"] = json::array();
         }
-        j["cells"] = cells;
+    } else {
+        root = json::object();
+        root["locations"] = json::array();
+    }
 
-        const std::string filename = "location_history.json";
-        json root;
-        std::ifstream inputFile(filename);
-        if (inputFile.good()) {
-            try {
-                inputFile >> root;
-                inputFile.close();
-            } catch (...) {
-                root = json::array();
-            }
-        } else {
-            root = json::array();
+    json entry;
+    entry["time"] = data.time;
+    entry["time_milliseconds"] = data.time_milliseconds;
+    entry["latitude"] = data.latitude;
+    entry["longitude"] = data.longitude;
+    entry["altitude"] = data.altitude;
+    entry["accuracy"] = data.accuracy;
+
+    json traffic;
+    traffic["total_rx"] = data.traffic.total_rx;
+    traffic["total_tx"] = data.traffic.total_tx;
+    traffic["total"] = data.traffic.total;
+    entry["traffic"] = traffic;
+
+    json cells = json::array();
+    for (const auto& cell : data.cellTowers) {
+        json cellJson;
+        cellJson["type"] = cell.type;
+        cellJson["mcc"] = cell.mcc;
+        cellJson["mnc"] = cell.mnc;
+        cellJson["pci"] = cell.pci;
+        cellJson["tac"] = cell.tac;
+        cellJson["timing_advance"] = cell.timing_advance;
+
+        if (cell.type == "LTE") {
+            cellJson["band"] = cell.band;
+            cellJson["cell_identity"] = cell.cell_identity;
+            cellJson["earfcn"] = cell.earfcn;
+            cellJson["asu_level"] = cell.asu_level;
+            cellJson["cqi"] = cell.cqi;
+            cellJson["rsrp"] = cell.rsrp;
+            cellJson["rsrq"] = cell.rsrq;
+            cellJson["rssnr"] = cell.rssnr;
+            cellJson["rssi"] = cell.rssi;
+        } else if (cell.type == "GSM") {
+            cellJson["cell_identity"] = cell.cell_identity;
+            cellJson["bsic"] = cell.bsic;
+            cellJson["arfcn"] = cell.arfcn;
+            cellJson["lac"] = cell.lac;
+            cellJson["dbm"] = cell.dbm;
+        } else if (cell.type == "NR") {
+            cellJson["nci"] = cell.nci;
+            cellJson["nrarfcn"] = cell.nrarfcn;
+            cellJson["ss_rsrp"] = cell.ss_rsrp;
+            cellJson["ss_rsrq"] = cell.ss_rsrq;
+            cellJson["ss_sinr"] = cell.ss_sinr;
+            cellJson["timing_advance_micros"] = cell.timing_advance_micros;
         }
-        if (!root.is_array()) root = json::array();
-        root.push_back(j);
-        std::ofstream outputFile(filename);
-        outputFile << root.dump(4);
-        outputFile.close();
-    } catch (const std::exception& e) {}
+        cells.push_back(cellJson);
+    }
+    entry["cells"] = cells;
+
+    root["locations"].push_back(entry);
+
+    std::ofstream outputFile(filename);
+    outputFile << root.dump(4);
+    outputFile.close();
 }
 
 CellTowerData parseCellTower(const json& cellJson) {
@@ -168,9 +174,6 @@ void run_server() {
     try {
         socket.bind("tcp://*:80");
         std::cout << "Server started on port 80" << std::endl;
-        int counter = 0;
-        auto last_save_time = std::chrono::steady_clock::now();
-        const std::chrono::seconds save_interval(10);
 
         while (true) {
             try {
@@ -223,12 +226,7 @@ void run_server() {
                             g_locationData.cellTowers = newData.cellTowers;
                         }
 
-                        auto now = std::chrono::steady_clock::now();
-                        if (now - last_save_time >= save_interval) {
-                            counter++;
-                            saveToJsonFile(newData, counter);
-                            last_save_time = now;
-                        }
+                        saveToJsonFile(newData);
 
                         std::cout << "Received data at " << newData.time << std::endl;
                         std::cout << "  Location: " << newData.latitude << ", " << newData.longitude
