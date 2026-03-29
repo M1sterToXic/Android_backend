@@ -1,4 +1,5 @@
 #include <GL/glew.h>
+#include <SDL2/SDL.h>
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -12,6 +13,10 @@
 #include <queue>
 #include <zmq.hpp>
 #include <nlohmann/json.hpp>
+#include "backends/imgui_impl_opengl3.h"
+#include "backends/imgui_impl_sdl2.h"
+#include "imgui.h"
+#include "implot.h"
 
 using json = nlohmann::json;
 
@@ -50,7 +55,51 @@ struct LocationData {
     std::mutex mutex;
 };
 
+struct FilterSettings {
+    bool sendLocation = true;
+    bool sendLTE = true;
+    bool sendGSM = true;
+    bool sendNR = true;
+    bool sendTraffic = true;
+    std::mutex mutex;
+};
+
+struct TowerSignalHistory {
+    std::vector<double> rsrp;
+    std::vector<double> rsrq;
+    std::vector<double> ss_rsrp;
+    std::vector<double> ss_rsrq;
+    std::vector<double> ss_sinr;
+    std::vector<double> dbm;
+    std::mutex mutex;
+    static const size_t MAX_SIZE = 100;
+};
+
+std::map<std::string, TowerSignalHistory> g_towerHistories;
+std::mutex g_historiesMutex;
+
 LocationData g_locationData;
+FilterSettings g_filterSettings;
+std::mutex g_commandMutex;
+std::queue<json> g_commandQueue;
+bool g_commandsEnabled = false;
+
+void sendFilterCommands() {
+    if (!g_commandsEnabled) return;
+    try {
+        json command;
+        command["type"] = "filter_update";
+        command["filters"] = {
+            {"location", g_filterSettings.sendLocation},
+            {"lte", g_filterSettings.sendLTE},
+            {"gsm", g_filterSettings.sendGSM},
+            {"nr", g_filterSettings.sendNR},
+            {"traffic", g_filterSettings.sendTraffic}
+        };
+        std::lock_guard<std::mutex> lock(g_commandMutex);
+        g_commandQueue.push(command);
+    } catch (const std::exception& e) {}
+}
 
 void saveToJsonFile(const LocationData& data, int counter) {
     try {
@@ -127,6 +176,577 @@ void saveToJsonFile(const LocationData& data, int counter) {
     } catch (const std::exception& e) {}
 }
 
+void run_gui(LocationData* loc) {
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER);
+    SDL_Window* window = SDL_CreateWindow(
+        "Data Monitor",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        1800, 1100, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
+    ImGui::CreateContext();
+    ImPlot::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 8.0f;
+    style.FrameRounding = 6.0f;
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_WindowBg] = ImVec4(0.09f, 0.10f, 0.12f, 1.00f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.20f, 0.22f, 0.24f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.25f, 0.27f, 0.29f, 1.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.17f, 0.20f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.00f, 0.50f, 0.80f, 0.60f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.00f, 0.60f, 0.90f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.00f, 0.70f, 1.00f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.30f, 0.32f, 0.35f, 1.00f);
+    style.WindowPadding = ImVec2(20, 20);
+    style.FramePadding = ImVec2(15, 10);
+    style.ItemSpacing = ImVec2(15, 15);
+    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
+    ImGui_ImplOpenGL3_Init("#version 330");
+    io.FontGlobalScale = 1.4f;
+
+    bool running = true;
+
+    while (running) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL2_ProcessEvent(&event);
+            if (event.type == SDL_QUIT) running = false;
+        }
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(1800, 1100));
+        ImGui::Begin("Main", nullptr,
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse |
+            ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoSavedSettings);
+
+        float filtersChanged = false;
+        bool locVal = false, lteVal = false, gsmVal = false, nrVal = false, trafficVal = false;
+        {
+            std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+            locVal = g_filterSettings.sendLocation;
+            lteVal = g_filterSettings.sendLTE;
+            gsmVal = g_filterSettings.sendGSM;
+            nrVal = g_filterSettings.sendNR;
+            trafficVal = g_filterSettings.sendTraffic;
+        }
+
+        ImGui::Columns(2, "top_row", false);
+        ImGui::SetColumnWidth(0, 450);
+
+        ImGui::BeginChild("FiltersChild", ImVec2(0, 300), true);
+        ImGui::TextColored(ImVec4(0.00f, 1.00f, 0.00f, 1.00f), "FILTERS");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Checkbox("Send Location Data", &locVal)) {
+            std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+            g_filterSettings.sendLocation = locVal;
+            filtersChanged = true;
+        }
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Send LTE Data", &lteVal)) {
+            std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+            g_filterSettings.sendLTE = lteVal;
+            filtersChanged = true;
+        }
+        if (ImGui::Checkbox("Send GSM Data", &gsmVal)) {
+            std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+            g_filterSettings.sendGSM = gsmVal;
+            filtersChanged = true;
+        }
+        if (ImGui::Checkbox("Send NR (5G) Data", &nrVal)) {
+            std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+            g_filterSettings.sendNR = nrVal;
+            filtersChanged = true;
+        }
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Send Traffic Statistics", &trafficVal)) {
+            std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+            g_filterSettings.sendTraffic = trafficVal;
+            filtersChanged = true;
+        }
+        if (filtersChanged) {
+            g_commandsEnabled = true;
+            sendFilterCommands();
+        }
+        ImGui::EndChild();
+
+        ImGui::NextColumn();
+        ImGui::SetColumnWidth(1, 1200);
+
+        ImGui::BeginChild("PositionChild", ImVec2(0, 300), true);
+        ImGui::TextColored(ImVec4(0.00f, 1.00f, 0.00f, 1.00f), "CURRENT POSITION");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Latitude:");
+        ImGui::SameLine(120);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.6f°", loc->latitude);
+        ImGui::PopStyleColor();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Longitude:");
+        ImGui::SameLine(120);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.6f°", loc->longitude);
+        ImGui::PopStyleColor();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Altitude:");
+        ImGui::SameLine(120);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.2f m", loc->altitude);
+        ImGui::PopStyleColor();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Accuracy:");
+        ImGui::SameLine(120);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.2f m", loc->accuracy);
+        ImGui::PopStyleColor();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Time:");
+        ImGui::SameLine(150);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%s", loc->time.c_str());
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(0.00f, 1.00f, 0.00f, 1.00f), "TRAFFIC");
+        ImGui::Spacing();
+
+        float total_mb = loc->traffic.total / (1024.0 * 1024.0);
+        float rx_mb = loc->traffic.total_rx / (1024.0 * 1024.0);
+        float tx_mb = loc->traffic.total_tx / (1024.0 * 1024.0);
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Total:");
+        ImGui::SameLine(90);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.2f MB", total_mb);
+        ImGui::PopStyleColor();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Download (RX):");
+        ImGui::SameLine(160);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.2f MB", rx_mb);
+        ImGui::PopStyleColor();
+
+        ImGui::TextColored(ImVec4(0.80f, 0.80f, 0.80f, 1.00f), "Upload (TX):");
+        ImGui::SameLine(150);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.00f, 1.00f, 0.00f, 1.00f));
+        ImGui::Text("%.2f MB", tx_mb);
+        ImGui::PopStyleColor();
+
+        ImGui::EndChild();
+
+        ImGui::Columns(1);
+        ImGui::Spacing();
+
+        ImGui::BeginChild("GraphsChild", ImVec2(0, 800), true);
+        ImGui::TextColored(ImVec4(0.00f, 1.00f, 0.00f, 1.00f), "SIGNAL STRENGTH GRAPHS");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        {
+            std::vector<CellTowerData> currentTowers;
+            {
+                std::lock_guard<std::mutex> lock(loc->mutex);
+                currentTowers = loc->cellTowers;
+            }
+
+            std::vector<CellTowerData> filtered;
+            for (const auto& cell : currentTowers) {
+                bool sendThisType = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+                    if (cell.type == "LTE") sendThisType = g_filterSettings.sendLTE;
+                    else if (cell.type == "GSM") sendThisType = g_filterSettings.sendGSM;
+                    else if (cell.type == "NR") sendThisType = g_filterSettings.sendNR;
+                }
+                if (sendThisType) {
+                    filtered.push_back(cell);
+                }
+            }
+
+            std::sort(filtered.begin(), filtered.end(),
+                [](const CellTowerData& a, const CellTowerData& b) {
+                    bool aValid = (a.mcc != 2147483647 && a.mnc != 2147483647);
+                    bool bValid = (b.mcc != 2147483647 && b.mnc != 2147483647);
+                    
+                    if (aValid && !bValid) return true;
+                    if (!aValid && bValid) return false;
+                    
+                    if (aValid && bValid) {
+                        if (a.mcc != b.mcc) return a.mcc < b.mcc;
+                        return a.mnc < b.mnc;
+                    }
+                    
+                    if (!aValid && !bValid) {
+                        if (a.mcc != b.mcc) return a.mcc < b.mcc;
+                        return a.mnc < b.mnc;
+                    }
+                    
+                    return false;
+                });
+
+            const size_t maxTowersPerType = 5;
+            std::vector<CellTowerData> lteTowers, nrTowers, gsmTowers;
+            for (const auto& cell : filtered) {
+                if (cell.type == "LTE" && lteTowers.size() < maxTowersPerType) lteTowers.push_back(cell);
+                else if (cell.type == "NR" && nrTowers.size() < maxTowersPerType) nrTowers.push_back(cell);
+                else if (cell.type == "GSM" && gsmTowers.size() < maxTowersPerType) gsmTowers.push_back(cell);
+            }
+
+            const size_t windowSize = 20;
+
+            if (!lteTowers.empty()) {
+                if (ImPlot::BeginPlot("LTE RSRP (dBm)", ImVec2(-1, 270))) {
+                    ImPlot::SetupAxes("Sample", "dBm");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+                    for (size_t i = 0; i < lteTowers.size(); ++i) {
+                        std::string key = "LTE_" + std::to_string(lteTowers[i].mcc) + "_" + std::to_string(lteTowers[i].mnc) + "_" + std::to_string(lteTowers[i].pci);
+                        std::lock_guard<std::mutex> lock(g_historiesMutex);
+                        auto it = g_towerHistories.find(key);
+                        if (it != g_towerHistories.end()) {
+                            size_t n = it->second.rsrp.size();
+                            if (n > 0) {
+                                const double* data = n > windowSize ? it->second.rsrp.data() + (n - windowSize) : it->second.rsrp.data();
+                                size_t count = n > windowSize ? windowSize : n;
+                                ImPlot::PlotLine(("RSRP " + std::to_string(i+1)).c_str(), data, count);
+                            }
+                        }
+                    }
+                    ImPlot::EndPlot();
+                }
+
+                if (ImPlot::BeginPlot("LTE RSRQ (dB)", ImVec2(-1, 270))) {
+                    ImPlot::SetupAxes("Sample", "dB");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+                    for (size_t i = 0; i < lteTowers.size(); ++i) {
+                        std::string key = "LTE_" + std::to_string(lteTowers[i].mcc) + "_" + std::to_string(lteTowers[i].mnc) + "_" + std::to_string(lteTowers[i].pci);
+                        std::lock_guard<std::mutex> lock(g_historiesMutex);
+                        auto it = g_towerHistories.find(key);
+                        if (it != g_towerHistories.end()) {
+                            size_t n = it->second.rsrq.size();
+                            if (n > 0) {
+                                const double* data = n > windowSize ? it->second.rsrq.data() + (n - windowSize) : it->second.rsrq.data();
+                                size_t count = n > windowSize ? windowSize : n;
+                                ImPlot::PlotLine(("RSRQ " + std::to_string(i+1)).c_str(), data, count);
+                            }
+                        }
+                    }
+                    ImPlot::EndPlot();
+                }
+            }
+
+            if (!nrTowers.empty()) {
+                if (ImPlot::BeginPlot("NR SS-RSRP (dBm)", ImVec2(-1, 270))) {
+                    ImPlot::SetupAxes("Sample", "dBm");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+                    for (size_t i = 0; i < nrTowers.size(); ++i) {
+                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" + std::to_string(nrTowers[i].mnc) + "_" + std::to_string(nrTowers[i].pci);
+                        std::lock_guard<std::mutex> lock(g_historiesMutex);
+                        auto it = g_towerHistories.find(key);
+                        if (it != g_towerHistories.end()) {
+                            size_t n = it->second.ss_rsrp.size();
+                            if (n > 0) {
+                                const double* data = n > windowSize ? it->second.ss_rsrp.data() + (n - windowSize) : it->second.ss_rsrp.data();
+                                size_t count = n > windowSize ? windowSize : n;
+                                ImPlot::PlotLine(("SS-RSRP " + std::to_string(i+1)).c_str(), data, count);
+                            }
+                        }
+                    }
+                    ImPlot::EndPlot();
+                }
+
+                if (ImPlot::BeginPlot("NR SS-RSRQ (dB)", ImVec2(-1, 270))) {
+                    ImPlot::SetupAxes("Sample", "dB");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+                    for (size_t i = 0; i < nrTowers.size(); ++i) {
+                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" + std::to_string(nrTowers[i].mnc) + "_" + std::to_string(nrTowers[i].pci);
+                        std::lock_guard<std::mutex> lock(g_historiesMutex);
+                        auto it = g_towerHistories.find(key);
+                        if (it != g_towerHistories.end()) {
+                            size_t n = it->second.ss_rsrq.size();
+                            if (n > 0) {
+                                const double* data = n > windowSize ? it->second.ss_rsrq.data() + (n - windowSize) : it->second.ss_rsrq.data();
+                                size_t count = n > windowSize ? windowSize : n;
+                                ImPlot::PlotLine(("SS-RSRQ " + std::to_string(i+1)).c_str(), data, count);
+                            }
+                        }
+                    }
+                    ImPlot::EndPlot();
+                }
+
+                if (ImPlot::BeginPlot("NR SS-SINR (dB)", ImVec2(-1, 270))) {
+                    ImPlot::SetupAxes("Sample", "dB");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+                    for (size_t i = 0; i < nrTowers.size(); ++i) {
+                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" + std::to_string(nrTowers[i].mnc) + "_" + std::to_string(nrTowers[i].pci);
+                        std::lock_guard<std::mutex> lock(g_historiesMutex);
+                        auto it = g_towerHistories.find(key);
+                        if (it != g_towerHistories.end()) {
+                            size_t n = it->second.ss_sinr.size();
+                            if (n > 0) {
+                                const double* data = n > windowSize ? it->second.ss_sinr.data() + (n - windowSize) : it->second.ss_sinr.data();
+                                size_t count = n > windowSize ? windowSize : n;
+                                ImPlot::PlotLine(("SS-SINR " + std::to_string(i+1)).c_str(), data, count);
+                            }
+                        }
+                    }
+                    ImPlot::EndPlot();
+                }
+            }
+
+            if (!gsmTowers.empty()) {
+                if (ImPlot::BeginPlot("GSM Dbm (dBm)", ImVec2(-1, 270))) {
+                    ImPlot::SetupAxes("Sample", "dBm");
+                    ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+                    for (size_t i = 0; i < gsmTowers.size(); ++i) {
+                        std::string key = "GSM_" + std::to_string(gsmTowers[i].mcc) + "_" + std::to_string(gsmTowers[i].mnc) + "_" + std::to_string(gsmTowers[i].pci);
+                        std::lock_guard<std::mutex> lock(g_historiesMutex);
+                        auto it = g_towerHistories.find(key);
+                        if (it != g_towerHistories.end()) {
+                            size_t n = it->second.dbm.size();
+                            if (n > 0) {
+                                const double* data = n > windowSize ? it->second.dbm.data() + (n - windowSize) : it->second.dbm.data();
+                                size_t count = n > windowSize ? windowSize : n;
+                                ImPlot::PlotLine(("Dbm " + std::to_string(i+1)).c_str(), data, count);
+                            }
+                        }
+                    }
+                    ImPlot::EndPlot();
+                }
+            }
+
+            if (lteTowers.empty() && nrTowers.empty() && gsmTowers.empty()) {
+                ImGui::Text("No data yet");
+            }
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::BeginChild("TelephonyChild", ImVec2(0, 400), true);
+        ImGui::TextColored(ImVec4(0.00f, 1.00f, 0.00f, 1.00f), "TELEPHONY DATA");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        {
+            std::vector<CellTowerData> allTowers;
+            {
+                std::lock_guard<std::mutex> lock(loc->mutex);
+                allTowers = loc->cellTowers;
+            }
+
+            std::vector<CellTowerData> filtered;
+            for (const auto& cell : allTowers) {
+                bool sendThisType = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+                    if (cell.type == "LTE") sendThisType = g_filterSettings.sendLTE;
+                    else if (cell.type == "GSM") sendThisType = g_filterSettings.sendGSM;
+                    else if (cell.type == "NR") sendThisType = g_filterSettings.sendNR;
+                }
+                if (sendThisType) {
+                    filtered.push_back(cell);
+                }
+            }
+
+            std::sort(filtered.begin(), filtered.end(),
+                [](const CellTowerData& a, const CellTowerData& b) {
+                    bool aValid = (a.mcc != 2147483647 && a.mnc != 2147483647);
+                    bool bValid = (b.mcc != 2147483647 && b.mnc != 2147483647);
+                    
+                    if (aValid && !bValid) return true;
+                    if (!aValid && bValid) return false;
+                    
+                    if (aValid && bValid) {
+                        if (a.mcc != b.mcc) return a.mcc < b.mcc;
+                        return a.mnc < b.mnc;
+                    }
+                    
+                    if (!aValid && !bValid) {
+                        if (a.mcc != b.mcc) return a.mcc < b.mcc;
+                        return a.mnc < b.mnc;
+                    }
+                    
+                    return false;
+                });
+
+            size_t count = std::min<size_t>(filtered.size(), 5);
+            for (size_t i = 0; i < count; ++i) {
+                const auto& cell = filtered[i];
+                ImVec4 typeColor;
+                if (cell.type == "LTE") typeColor = ImVec4(0.00f, 1.00f, 1.00f, 1.00f);
+                else if (cell.type == "NR") typeColor = ImVec4(1.00f, 0.80f, 0.00f, 1.00f);
+                else typeColor = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, typeColor);
+                ImGui::Text("Tower %zu [%s]", i + 1, cell.type.c_str());
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(2, "tower_columns", false);
+                ImGui::SetColumnWidth(0, 500);
+
+                if (cell.type == "LTE") {
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "Band:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.band);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "Cell ID:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.cell_identity);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "EARFCN:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.earfcn);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "MCC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.mcc);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "MNC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.mnc);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "PCI:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.pci);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "TAC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.tac);
+                } else if (cell.type == "GSM") {
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "Cell ID:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.cell_identity);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "ARFCN:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.arfcn);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "BSIC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.bsic);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "LAC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.lac);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "MCC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.mcc);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "MNC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.mnc);
+                } else if (cell.type == "NR") {
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "Band:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.band);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "NCI:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%s", cell.nci.c_str());
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "NRARFCN:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.nrarfcn);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "PCI:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.pci);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "TAC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.tac);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "MCC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.mcc);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "MNC:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.mnc);
+                }
+
+                ImGui::NextColumn();
+
+                if (cell.type == "LTE") {
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "ASU Level:");
+                    ImGui::SameLine(120);
+                    ImGui::Text("%d", cell.asu_level);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "CQI:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.cqi);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "RSRP:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d dBm", cell.rsrp);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "RSRQ:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.rsrq);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "RSSI:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.rssi);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "RSSNR:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.rssnr);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "TA:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.timing_advance);
+                } else if (cell.type == "GSM") {
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "Dbm:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d dBm", cell.dbm);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "RSSI:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.rssi);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "TA:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.timing_advance);
+                } else if (cell.type == "NR") {
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "SS-RSRP:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d dBm", cell.ss_rsrp);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "SS-RSRQ:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.ss_rsrq);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "SS-SINR:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%d", cell.ss_sinr);
+                    ImGui::TextColored(ImVec4(0.80f,0.80f,0.80f,1.00f), "TA:");
+                    ImGui::SameLine(100);
+                    ImGui::Text("%ld µs", cell.timing_advance_micros);
+                }
+
+                ImGui::Columns(1);
+                if (i < count - 1) {
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+                }
+            }
+            if (filtered.empty()) {
+                ImGui::TextColored(ImVec4(1.00f, 0.50f, 0.50f, 1.00f), "No cell tower data");
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::End();
+
+        ImGui::Render();
+        glClearColor(0.08f, 0.09f, 0.10f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        SDL_GL_SwapWindow(window);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImPlot::DestroyContext();
+    ImGui::DestroyContext();
+    SDL_GL_DeleteContext(gl_context);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+}
+
 CellTowerData parseCellTower(const json& cellJson) {
     CellTowerData cell;
     cell.type = cellJson.value("type", "Unknown");
@@ -167,8 +787,7 @@ void run_server() {
     zmq::context_t context(1);
     zmq::socket_t socket(context, zmq::socket_type::rep);
     try {
-        socket.bind("tcp://*:80");
-        std::cout << "Server started on port 80" << std::endl;
+        socket.bind("tcp://*:5555");
         int counter = 0;
         auto last_save_time = std::chrono::steady_clock::now();
         const std::chrono::seconds save_interval(10);
@@ -224,6 +843,38 @@ void run_server() {
                             g_locationData.cellTowers = newData.cellTowers;
                         }
 
+                        {
+                            std::lock_guard<std::mutex> lock(g_historiesMutex);
+                            for (const auto& cell : newData.cellTowers) {
+                                std::string key;
+                                if (cell.type == "LTE") {
+                                    key = "LTE_" + std::to_string(cell.mcc) + "_" + std::to_string(cell.mnc) + "_" + std::to_string(cell.pci);
+                                    g_towerHistories[key].rsrp.push_back(cell.rsrp);
+                                    g_towerHistories[key].rsrq.push_back(cell.rsrq);
+                                    if (g_towerHistories[key].rsrp.size() > TowerSignalHistory::MAX_SIZE) {
+                                        g_towerHistories[key].rsrp.erase(g_towerHistories[key].rsrp.begin());
+                                        g_towerHistories[key].rsrq.erase(g_towerHistories[key].rsrq.begin());
+                                    }
+                                } else if (cell.type == "NR") {
+                                    key = "NR_" + std::to_string(cell.mcc) + "_" + std::to_string(cell.mnc) + "_" + std::to_string(cell.pci);
+                                    g_towerHistories[key].ss_rsrp.push_back(cell.ss_rsrp);
+                                    g_towerHistories[key].ss_rsrq.push_back(cell.ss_rsrq);
+                                    g_towerHistories[key].ss_sinr.push_back(cell.ss_sinr);
+                                    if (g_towerHistories[key].ss_rsrp.size() > TowerSignalHistory::MAX_SIZE) {
+                                        g_towerHistories[key].ss_rsrp.erase(g_towerHistories[key].ss_rsrp.begin());
+                                        g_towerHistories[key].ss_rsrq.erase(g_towerHistories[key].ss_rsrq.begin());
+                                        g_towerHistories[key].ss_sinr.erase(g_towerHistories[key].ss_sinr.begin());
+                                    }
+                                } else if (cell.type == "GSM") {
+                                    key = "GSM_" + std::to_string(cell.mcc) + "_" + std::to_string(cell.mnc) + "_" + std::to_string(cell.pci);
+                                    g_towerHistories[key].dbm.push_back(cell.dbm);
+                                    if (g_towerHistories[key].dbm.size() > TowerSignalHistory::MAX_SIZE) {
+                                        g_towerHistories[key].dbm.erase(g_towerHistories[key].dbm.begin());
+                                    }
+                                }
+                            }
+                        }
+
                         auto now = std::chrono::steady_clock::now();
                         if (now - last_save_time >= save_interval) {
                             counter++;
@@ -231,28 +882,24 @@ void run_server() {
                             last_save_time = now;
                         }
 
-                        std::cout << "Received data at " << newData.time << std::endl;
-                        std::cout << "  Location: " << newData.latitude << ", " << newData.longitude
-                                  << " (alt: " << newData.altitude << " m, acc: " << newData.accuracy << " m)" << std::endl;
-                        std::cout << "  Traffic: RX=" << newData.traffic.total_rx << " bytes, TX=" << newData.traffic.total_tx
-                                  << " bytes, Total=" << newData.traffic.total << " bytes" << std::endl;
-                        std::cout << "  Cell towers (" << newData.cellTowers.size() << "):" << std::endl;
-                        for (const auto& cell : newData.cellTowers) {
-                            std::cout << "    Type: " << cell.type;
-                            if (cell.type == "LTE") {
-                                std::cout << ", MCC=" << cell.mcc << ", MNC=" << cell.mnc << ", PCI=" << cell.pci
-                                          << ", RSRP=" << cell.rsrp << " dBm, RSRQ=" << cell.rsrq << " dB";
-                            } else if (cell.type == "GSM") {
-                                std::cout << ", MCC=" << cell.mcc << ", MNC=" << cell.mnc << ", CID=" << cell.cell_identity
-                                          << ", Dbm=" << cell.dbm << " dBm";
-                            } else if (cell.type == "NR") {
-                                std::cout << ", MCC=" << cell.mcc << ", MNC=" << cell.mnc << ", PCI=" << cell.pci
-                                          << ", SS-RSRP=" << cell.ss_rsrp << " dBm";
+                        json command;
+                        bool hasCommand = false;
+                        {
+                            std::lock_guard<std::mutex> lock(g_commandMutex);
+                            if (!g_commandQueue.empty()) {
+                                command = g_commandQueue.front();
+                                g_commandQueue.pop();
+                                hasCommand = true;
                             }
-                            std::cout << std::endl;
                         }
 
-                        std::string response = "OK";
+                        std::string response;
+                        if (hasCommand) {
+                            response = command.dump();
+                        } else {
+                            response = "OK";
+                        }
+
                         zmq::message_t reply(response.size());
                         memcpy(reply.data(), response.c_str(), response.size());
                         socket.send(reply, zmq::send_flags::none);
@@ -276,6 +923,8 @@ void run_server() {
 
 int main(int argc, char *argv[]) {
     std::thread server_thread(run_server);
+    std::thread gui_thread(run_gui, &g_locationData);
+    gui_thread.join();
     server_thread.join();
     return 0;
 }
