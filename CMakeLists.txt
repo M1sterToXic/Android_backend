@@ -13,6 +13,19 @@ include_directories(${SDL2_INCLUDE_DIRS})
 find_package(OpenGL REQUIRED)
 find_package(GLEW REQUIRED)
 
+find_package(PostgreSQL REQUIRED)
+include_directories(${PostgreSQL_INCLUDE_DIRS})
+
+find_path(LIBPQXX_INCLUDE_DIR NAMES pqxx/pqxx)
+find_library(LIBPQXX_LIBRARY NAMES pqxx)
+
+if(LIBPQXX_INCLUDE_DIR AND LIBPQXX_LIBRARY)
+    include_directories(${LIBPQXX_INCLUDE_DIR})
+    message(STATUS "libpqxx found: ${LIBPQXX_LIBRARY}")
+else()
+    message(FATAL_ERROR "libpqxx not found. Install it: sudo apt install libpqxx-dev")
+endif()
+
 include_directories(${INCLUDE_DIR})
 
 add_library(imgui STATIC
@@ -36,5 +49,21 @@ target_include_directories(implot PUBLIC ${THIRD_PARTY_DIR}/implot)
 target_link_libraries(implot PRIVATE imgui)
 target_compile_options(implot PRIVATE -fPIC)
 
-add_executable(main ${SRC_DIR}/main.cpp)
-target_link_libraries(main PRIVATE zmq imgui implot ${SDL2_LIBRARIES} ${OPENGL_LIBRARIES} ${GLEW_LIBRARIES} )
+add_library(database STATIC ${SRC_DIR}/database.cpp)
+target_include_directories(database PUBLIC ${INCLUDE_DIR})
+target_link_libraries(database PRIVATE ${PostgreSQL_LIBRARIES} ${LIBPQXX_LIBRARY})
+
+add_executable(main
+    ${SRC_DIR}/main.cpp
+    ${SRC_DIR}/database.cpp
+)
+target_link_libraries(main PRIVATE
+    zmq
+    imgui
+    implot
+    ${SDL2_LIBRARIES}
+    ${OPENGL_LIBRARIES}
+    ${GLEW_LIBRARIES}
+    ${PostgreSQL_LIBRARIES}
+    ${LIBPQXX_LIBRARY}
+)

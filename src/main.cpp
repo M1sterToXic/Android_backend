@@ -3,7 +3,6 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
-#include <fstream>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -17,8 +16,11 @@
 #include "backends/imgui_impl_sdl2.h"
 #include "imgui.h"
 #include "implot.h"
+#include "database.h"
 
 using json = nlohmann::json;
+
+DatabaseConnection g_dbConnection;
 
 struct CellTowerData {
     std::string type;
@@ -73,6 +75,24 @@ struct TowerSignalHistory {
     std::vector<double> dbm;
     std::mutex mutex;
     static const size_t MAX_SIZE = 100;
+
+    int mcc = 0;
+    int mnc = 0;
+    int pci = 0;
+    std::string type;
+};
+
+const ImVec4 g_pciColors[] = {
+    ImVec4(1.0f, 0.0f, 0.0f, 1.0f),
+    ImVec4(0.0f, 1.0f, 0.0f, 1.0f),
+    ImVec4(0.0f, 0.0f, 1.0f, 1.0f),
+    ImVec4(1.0f, 1.0f, 0.0f, 1.0f),
+    ImVec4(1.0f, 0.0f, 1.0f, 1.0f),
+    ImVec4(0.0f, 1.0f, 1.0f, 1.0f),
+    ImVec4(1.0f, 0.5f, 0.0f, 1.0f),
+    ImVec4(0.5f, 0.0f, 1.0f, 1.0f),
+    ImVec4(0.0f, 1.0f, 0.5f, 1.0f),
+    ImVec4(1.0f, 0.0f, 0.5f, 1.0f),
 };
 
 std::map<std::string, TowerSignalHistory> g_towerHistories;
@@ -83,6 +103,107 @@ FilterSettings g_filterSettings;
 std::mutex g_commandMutex;
 std::queue<json> g_commandQueue;
 bool g_commandsEnabled = false;
+
+void saveToDatabase(const LocationData& data) {
+    if (!db_is_connected(g_dbConnection)) {
+        return;
+    }
+
+    std::vector<CellTowerData> filtered;
+    {
+        std::lock_guard<std::mutex> lock(g_filterSettings.mutex);
+        for (const auto& cell : data.cellTowers) {
+            bool sendThisType = false;
+            if (cell.type == "LTE") sendThisType = g_filterSettings.sendLTE;
+            else if (cell.type == "GSM") sendThisType = g_filterSettings.sendGSM;
+            else if (cell.type == "NR") sendThisType = g_filterSettings.sendNR;
+            if (sendThisType) {
+                filtered.push_back(cell);
+            }
+        }
+    }
+
+    std::sort(filtered.begin(), filtered.end(),
+        [](const CellTowerData& a, const CellTowerData& b) {
+            bool aValid = (a.mcc != 2147483647 && a.mnc != 2147483647);
+            bool bValid = (b.mcc != 2147483647 && b.mnc != 2147483647);
+            if (aValid && !bValid) return true;
+            if (!aValid && bValid) return false;
+            if (aValid && bValid) {
+                if (a.mcc != b.mcc) return a.mcc < b.mcc;
+                return a.mnc < b.mnc;
+            }
+            if (!aValid && !bValid) {
+                if (a.mcc != b.mcc) return a.mcc < b.mcc;
+                return a.mnc < b.mnc;
+            }
+            return false;
+        });
+
+    const size_t maxTowersPerType = 5;
+    std::vector<CellTowerData> lteTowers, nrTowers, gsmTowers;
+    for (const auto& cell : filtered) {
+        if (cell.type == "LTE" && lteTowers.size() < maxTowersPerType) lteTowers.push_back(cell);
+        else if (cell.type == "NR" && nrTowers.size() < maxTowersPerType) nrTowers.push_back(cell);
+        else if (cell.type == "GSM" && gsmTowers.size() < maxTowersPerType) gsmTowers.push_back(cell);
+    }
+
+    std::vector<CellTowerData> cellsToSave;
+    cellsToSave.insert(cellsToSave.end(), lteTowers.begin(), lteTowers.end());
+    cellsToSave.insert(cellsToSave.end(), gsmTowers.begin(), gsmTowers.end());
+    cellsToSave.insert(cellsToSave.end(), nrTowers.begin(), nrTowers.end());
+
+    int location_id = db_insert_location(
+        g_dbConnection,
+        data.time_milliseconds,
+        data.time,
+        data.latitude,
+        data.longitude,
+        data.altitude,
+        data.accuracy,
+        data.traffic.total_rx,
+        data.traffic.total_tx,
+        data.traffic.total
+    );
+
+    if (location_id <= 0) {
+        std::cerr << "[DB] Error: failed to insert location data" << std::endl;
+        return;
+    }
+
+    for (const auto& cell : cellsToSave) {
+        db_insert_cell(
+            g_dbConnection,
+            location_id,
+            data.time_milliseconds,
+            cell.type,
+            cell.mcc,
+            cell.mnc,
+            cell.pci,
+            cell.tac,
+            cell.lac,
+            cell.cell_identity,
+            cell.earfcn,
+            cell.arfcn,
+            cell.nrarfcn,
+            cell.band,
+            cell.rsrp,
+            cell.rsrq,
+            cell.rssi,
+            cell.rssnr,
+            cell.ss_rsrp,
+            cell.ss_rsrq,
+            cell.ss_sinr,
+            cell.dbm,
+            cell.asu_level,
+            cell.cqi,
+            cell.timing_advance,
+            cell.timing_advance_micros,
+            cell.bsic,
+            cell.nci
+        );
+    }
+}
 
 void sendFilterCommands() {
     if (!g_commandsEnabled) return;
@@ -101,80 +222,6 @@ void sendFilterCommands() {
     } catch (const std::exception& e) {}
 }
 
-void saveToJsonFile(const LocationData& data, int counter) {
-    try {
-        json j;
-        j["counter"] = counter;
-        j["latitude"] = data.latitude;
-        j["longitude"] = data.longitude;
-        j["altitude"] = data.altitude;
-        j["accuracy"] = data.accuracy;
-        j["time"] = data.time;
-        j["time_milliseconds"] = data.time_milliseconds;
-
-        json traffic;
-        traffic["total_rx"] = data.traffic.total_rx;
-        traffic["total_tx"] = data.traffic.total_tx;
-        traffic["total"] = data.traffic.total;
-        j["traffic"] = traffic;
-
-        json cells = json::array();
-        for (const auto& cell : data.cellTowers) {
-            json cellJson;
-            cellJson["type"] = cell.type;
-            cellJson["mcc"] = cell.mcc;
-            cellJson["mnc"] = cell.mnc;
-            cellJson["pci"] = cell.pci;
-            cellJson["tac"] = cell.tac;
-            cellJson["timing_advance"] = cell.timing_advance;
-
-            if (cell.type == "LTE") {
-                cellJson["band"] = cell.band;
-                cellJson["cell_identity"] = cell.cell_identity;
-                cellJson["earfcn"] = cell.earfcn;
-                cellJson["asu_level"] = cell.asu_level;
-                cellJson["cqi"] = cell.cqi;
-                cellJson["rsrp"] = cell.rsrp;
-                cellJson["rsrq"] = cell.rsrq;
-                cellJson["rssi"] = cell.rssi;
-                cellJson["rssnr"] = cell.rssnr;
-            } else if (cell.type == "GSM") {
-                cellJson["bsic"] = cell.bsic;
-                cellJson["arfcn"] = cell.arfcn;
-                cellJson["lac"] = cell.lac;
-                cellJson["dbm"] = cell.dbm;
-            } else if (cell.type == "NR") {
-                cellJson["nci"] = cell.nci;
-                cellJson["nrarfcn"] = cell.nrarfcn;
-                cellJson["ss_rsrp"] = cell.ss_rsrp;
-                cellJson["ss_rsrq"] = cell.ss_rsrq;
-                cellJson["ss_sinr"] = cell.ss_sinr;
-                cellJson["timing_advance_micros"] = cell.timing_advance_micros;
-            }
-            cells.push_back(cellJson);
-        }
-        j["cells"] = cells;
-
-        const std::string filename = "location_history.json";
-        json root;
-        std::ifstream inputFile(filename);
-        if (inputFile.good()) {
-            try {
-                inputFile >> root;
-                inputFile.close();
-            } catch (...) {
-                root = json::array();
-            }
-        } else {
-            root = json::array();
-        }
-        if (!root.is_array()) root = json::array();
-        root.push_back(j);
-        std::ofstream outputFile(filename);
-        outputFile << root.dump(4);
-        outputFile.close();
-    } catch (const std::exception& e) {}
-}
 
 void run_gui(LocationData* loc) {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER);
@@ -413,16 +460,26 @@ void run_gui(LocationData* loc) {
                 if (ImPlot::BeginPlot("LTE RSRP (dBm)", ImVec2(-1, 270))) {
                     ImPlot::SetupAxes("Sample", "dBm");
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+
                     for (size_t i = 0; i < lteTowers.size(); ++i) {
-                        std::string key = "LTE_" + std::to_string(lteTowers[i].mcc) + "_" + std::to_string(lteTowers[i].mnc) + "_" + std::to_string(lteTowers[i].pci);
+                        std::string key = "LTE_" + std::to_string(lteTowers[i].mcc) + "_" +
+                                          std::to_string(lteTowers[i].mnc) + "_" +
+                                          std::to_string(lteTowers[i].pci);
                         std::lock_guard<std::mutex> lock(g_historiesMutex);
                         auto it = g_towerHistories.find(key);
                         if (it != g_towerHistories.end()) {
                             size_t n = it->second.rsrp.size();
                             if (n > 0) {
+                                std::string label = "PCI " + std::to_string(lteTowers[i].pci) +
+                                                    " (MCC:" + std::to_string(lteTowers[i].mcc) +
+                                                    " MNC:" + std::to_string(lteTowers[i].mnc) +
+                                                    ") " + std::to_string((int)it->second.rsrp.back()) + " dBm";
+
                                 const double* data = n > windowSize ? it->second.rsrp.data() + (n - windowSize) : it->second.rsrp.data();
                                 size_t count = n > windowSize ? windowSize : n;
-                                ImPlot::PlotLine(("RSRP " + std::to_string(i+1)).c_str(), data, count);
+
+                                ImPlot::SetNextLineStyle(g_pciColors[i % (sizeof(g_pciColors)/sizeof(g_pciColors[0]))]);
+                                ImPlot::PlotLine(label.c_str(), data, count);
                             }
                         }
                     }
@@ -432,16 +489,24 @@ void run_gui(LocationData* loc) {
                 if (ImPlot::BeginPlot("LTE RSRQ (dB)", ImVec2(-1, 270))) {
                     ImPlot::SetupAxes("Sample", "dB");
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+
                     for (size_t i = 0; i < lteTowers.size(); ++i) {
-                        std::string key = "LTE_" + std::to_string(lteTowers[i].mcc) + "_" + std::to_string(lteTowers[i].mnc) + "_" + std::to_string(lteTowers[i].pci);
+                        std::string key = "LTE_" + std::to_string(lteTowers[i].mcc) + "_" +
+                                          std::to_string(lteTowers[i].mnc) + "_" +
+                                          std::to_string(lteTowers[i].pci);
                         std::lock_guard<std::mutex> lock(g_historiesMutex);
                         auto it = g_towerHistories.find(key);
                         if (it != g_towerHistories.end()) {
                             size_t n = it->second.rsrq.size();
                             if (n > 0) {
+                                std::string label = "PCI " + std::to_string(lteTowers[i].pci) +
+                                                    " " + std::to_string((int)it->second.rsrq.back()) + " dB";
+
                                 const double* data = n > windowSize ? it->second.rsrq.data() + (n - windowSize) : it->second.rsrq.data();
                                 size_t count = n > windowSize ? windowSize : n;
-                                ImPlot::PlotLine(("RSRQ " + std::to_string(i+1)).c_str(), data, count);
+
+                                ImPlot::SetNextLineStyle(g_pciColors[i % (sizeof(g_pciColors)/sizeof(g_pciColors[0]))]);
+                                ImPlot::PlotLine(label.c_str(), data, count);
                             }
                         }
                     }
@@ -453,16 +518,24 @@ void run_gui(LocationData* loc) {
                 if (ImPlot::BeginPlot("NR SS-RSRP (dBm)", ImVec2(-1, 270))) {
                     ImPlot::SetupAxes("Sample", "dBm");
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+
                     for (size_t i = 0; i < nrTowers.size(); ++i) {
-                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" + std::to_string(nrTowers[i].mnc) + "_" + std::to_string(nrTowers[i].pci);
+                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" +
+                                          std::to_string(nrTowers[i].mnc) + "_" +
+                                          std::to_string(nrTowers[i].pci);
                         std::lock_guard<std::mutex> lock(g_historiesMutex);
                         auto it = g_towerHistories.find(key);
                         if (it != g_towerHistories.end()) {
                             size_t n = it->second.ss_rsrp.size();
                             if (n > 0) {
+                                std::string label = "PCI " + std::to_string(nrTowers[i].pci) +
+                                                    " " + std::to_string((int)it->second.ss_rsrp.back()) + " dBm";
+
                                 const double* data = n > windowSize ? it->second.ss_rsrp.data() + (n - windowSize) : it->second.ss_rsrp.data();
                                 size_t count = n > windowSize ? windowSize : n;
-                                ImPlot::PlotLine(("SS-RSRP " + std::to_string(i+1)).c_str(), data, count);
+
+                                ImPlot::SetNextLineStyle(g_pciColors[i % (sizeof(g_pciColors)/sizeof(g_pciColors[0]))]);
+                                ImPlot::PlotLine(label.c_str(), data, count);
                             }
                         }
                     }
@@ -472,16 +545,24 @@ void run_gui(LocationData* loc) {
                 if (ImPlot::BeginPlot("NR SS-RSRQ (dB)", ImVec2(-1, 270))) {
                     ImPlot::SetupAxes("Sample", "dB");
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+
                     for (size_t i = 0; i < nrTowers.size(); ++i) {
-                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" + std::to_string(nrTowers[i].mnc) + "_" + std::to_string(nrTowers[i].pci);
+                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" +
+                                          std::to_string(nrTowers[i].mnc) + "_" +
+                                          std::to_string(nrTowers[i].pci);
                         std::lock_guard<std::mutex> lock(g_historiesMutex);
                         auto it = g_towerHistories.find(key);
                         if (it != g_towerHistories.end()) {
                             size_t n = it->second.ss_rsrq.size();
                             if (n > 0) {
+                                std::string label = "PCI " + std::to_string(nrTowers[i].pci) +
+                                                    " " + std::to_string((int)it->second.ss_rsrq.back()) + " dB";
+
                                 const double* data = n > windowSize ? it->second.ss_rsrq.data() + (n - windowSize) : it->second.ss_rsrq.data();
                                 size_t count = n > windowSize ? windowSize : n;
-                                ImPlot::PlotLine(("SS-RSRQ " + std::to_string(i+1)).c_str(), data, count);
+
+                                ImPlot::SetNextLineStyle(g_pciColors[i % (sizeof(g_pciColors)/sizeof(g_pciColors[0]))]);
+                                ImPlot::PlotLine(label.c_str(), data, count);
                             }
                         }
                     }
@@ -491,16 +572,24 @@ void run_gui(LocationData* loc) {
                 if (ImPlot::BeginPlot("NR SS-SINR (dB)", ImVec2(-1, 270))) {
                     ImPlot::SetupAxes("Sample", "dB");
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+
                     for (size_t i = 0; i < nrTowers.size(); ++i) {
-                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" + std::to_string(nrTowers[i].mnc) + "_" + std::to_string(nrTowers[i].pci);
+                        std::string key = "NR_" + std::to_string(nrTowers[i].mcc) + "_" +
+                                          std::to_string(nrTowers[i].mnc) + "_" +
+                                          std::to_string(nrTowers[i].pci);
                         std::lock_guard<std::mutex> lock(g_historiesMutex);
                         auto it = g_towerHistories.find(key);
                         if (it != g_towerHistories.end()) {
                             size_t n = it->second.ss_sinr.size();
                             if (n > 0) {
+                                std::string label = "PCI " + std::to_string(nrTowers[i].pci) +
+                                                    " " + std::to_string((int)it->second.ss_sinr.back()) + " dB";
+
                                 const double* data = n > windowSize ? it->second.ss_sinr.data() + (n - windowSize) : it->second.ss_sinr.data();
                                 size_t count = n > windowSize ? windowSize : n;
-                                ImPlot::PlotLine(("SS-SINR " + std::to_string(i+1)).c_str(), data, count);
+
+                                ImPlot::SetNextLineStyle(g_pciColors[i % (sizeof(g_pciColors)/sizeof(g_pciColors[0]))]);
+                                ImPlot::PlotLine(label.c_str(), data, count);
                             }
                         }
                     }
@@ -512,16 +601,24 @@ void run_gui(LocationData* loc) {
                 if (ImPlot::BeginPlot("GSM Dbm (dBm)", ImVec2(-1, 270))) {
                     ImPlot::SetupAxes("Sample", "dBm");
                     ImPlot::SetupAxisLimits(ImAxis_X1, 0, windowSize-1, ImGuiCond_Always);
+
                     for (size_t i = 0; i < gsmTowers.size(); ++i) {
-                        std::string key = "GSM_" + std::to_string(gsmTowers[i].mcc) + "_" + std::to_string(gsmTowers[i].mnc) + "_" + std::to_string(gsmTowers[i].pci);
+                        std::string key = "GSM_" + std::to_string(gsmTowers[i].mcc) + "_" +
+                                          std::to_string(gsmTowers[i].mnc) + "_" +
+                                          std::to_string(gsmTowers[i].pci);
                         std::lock_guard<std::mutex> lock(g_historiesMutex);
                         auto it = g_towerHistories.find(key);
                         if (it != g_towerHistories.end()) {
                             size_t n = it->second.dbm.size();
                             if (n > 0) {
+                                std::string label = "PCI " + std::to_string(gsmTowers[i].pci) +
+                                                    " " + std::to_string((int)it->second.dbm.back()) + " dBm";
+
                                 const double* data = n > windowSize ? it->second.dbm.data() + (n - windowSize) : it->second.dbm.data();
                                 size_t count = n > windowSize ? windowSize : n;
-                                ImPlot::PlotLine(("Dbm " + std::to_string(i+1)).c_str(), data, count);
+
+                                ImPlot::SetNextLineStyle(g_pciColors[i % (sizeof(g_pciColors)/sizeof(g_pciColors[0]))]);
+                                ImPlot::PlotLine(label.c_str(), data, count);
                             }
                         }
                     }
@@ -569,20 +666,20 @@ void run_gui(LocationData* loc) {
                 [](const CellTowerData& a, const CellTowerData& b) {
                     bool aValid = (a.mcc != 2147483647 && a.mnc != 2147483647);
                     bool bValid = (b.mcc != 2147483647 && b.mnc != 2147483647);
-                    
+
                     if (aValid && !bValid) return true;
                     if (!aValid && bValid) return false;
-                    
+
                     if (aValid && bValid) {
                         if (a.mcc != b.mcc) return a.mcc < b.mcc;
                         return a.mnc < b.mnc;
                     }
-                    
+
                     if (!aValid && !bValid) {
                         if (a.mcc != b.mcc) return a.mcc < b.mcc;
                         return a.mnc < b.mnc;
                     }
-                    
+
                     return false;
                 });
 
@@ -788,9 +885,6 @@ void run_server() {
     zmq::socket_t socket(context, zmq::socket_type::rep);
     try {
         socket.bind("tcp://*:5555");
-        int counter = 0;
-        auto last_save_time = std::chrono::steady_clock::now();
-        const std::chrono::seconds save_interval(10);
 
         while (true) {
             try {
@@ -848,7 +942,13 @@ void run_server() {
                             for (const auto& cell : newData.cellTowers) {
                                 std::string key;
                                 if (cell.type == "LTE") {
-                                    key = "LTE_" + std::to_string(cell.mcc) + "_" + std::to_string(cell.mnc) + "_" + std::to_string(cell.pci);
+                                    key = "LTE_" + std::to_string(cell.mcc) + "_" +
+                                          std::to_string(cell.mnc) + "_" +
+                                          std::to_string(cell.pci);
+                                    g_towerHistories[key].mcc = cell.mcc;
+                                    g_towerHistories[key].mnc = cell.mnc;
+                                    g_towerHistories[key].pci = cell.pci;
+                                    g_towerHistories[key].type = cell.type;
                                     g_towerHistories[key].rsrp.push_back(cell.rsrp);
                                     g_towerHistories[key].rsrq.push_back(cell.rsrq);
                                     if (g_towerHistories[key].rsrp.size() > TowerSignalHistory::MAX_SIZE) {
@@ -856,7 +956,13 @@ void run_server() {
                                         g_towerHistories[key].rsrq.erase(g_towerHistories[key].rsrq.begin());
                                     }
                                 } else if (cell.type == "NR") {
-                                    key = "NR_" + std::to_string(cell.mcc) + "_" + std::to_string(cell.mnc) + "_" + std::to_string(cell.pci);
+                                    key = "NR_" + std::to_string(cell.mcc) + "_" +
+                                          std::to_string(cell.mnc) + "_" +
+                                          std::to_string(cell.pci);
+                                    g_towerHistories[key].mcc = cell.mcc;
+                                    g_towerHistories[key].mnc = cell.mnc;
+                                    g_towerHistories[key].pci = cell.pci;
+                                    g_towerHistories[key].type = cell.type;
                                     g_towerHistories[key].ss_rsrp.push_back(cell.ss_rsrp);
                                     g_towerHistories[key].ss_rsrq.push_back(cell.ss_rsrq);
                                     g_towerHistories[key].ss_sinr.push_back(cell.ss_sinr);
@@ -866,7 +972,13 @@ void run_server() {
                                         g_towerHistories[key].ss_sinr.erase(g_towerHistories[key].ss_sinr.begin());
                                     }
                                 } else if (cell.type == "GSM") {
-                                    key = "GSM_" + std::to_string(cell.mcc) + "_" + std::to_string(cell.mnc) + "_" + std::to_string(cell.pci);
+                                    key = "GSM_" + std::to_string(cell.mcc) + "_" +
+                                          std::to_string(cell.mnc) + "_" +
+                                          std::to_string(cell.pci);
+                                    g_towerHistories[key].mcc = cell.mcc;
+                                    g_towerHistories[key].mnc = cell.mnc;
+                                    g_towerHistories[key].pci = cell.pci;
+                                    g_towerHistories[key].type = cell.type;
                                     g_towerHistories[key].dbm.push_back(cell.dbm);
                                     if (g_towerHistories[key].dbm.size() > TowerSignalHistory::MAX_SIZE) {
                                         g_towerHistories[key].dbm.erase(g_towerHistories[key].dbm.begin());
@@ -875,12 +987,7 @@ void run_server() {
                             }
                         }
 
-                        auto now = std::chrono::steady_clock::now();
-                        if (now - last_save_time >= save_interval) {
-                            counter++;
-                            saveToJsonFile(newData, counter);
-                            last_save_time = now;
-                        }
+                        saveToDatabase(newData);
 
                         json command;
                         bool hasCommand = false;
@@ -922,9 +1029,21 @@ void run_server() {
 }
 
 int main(int argc, char *argv[]) {
+    std::cout << "[DB] Connecting to database..." << std::endl;
+    if (!db_init(g_dbConnection, "localhost", "telecom_db", "postgres", "postgres")) {
+        std::cerr << "[DB] Warning: failed to connect to PostgreSQL." << std::endl;
+        std::cerr << "[DB] Application will run without database saving." << std::endl;
+        std::cerr << "[DB] To connect, install PostgreSQL and run:" << std::endl;
+        std::cerr << "[DB]   psql -U postgres -f database/init_db.sql" << std::endl;
+    }
+
     std::thread server_thread(run_server);
     std::thread gui_thread(run_gui, &g_locationData);
+
     gui_thread.join();
     server_thread.join();
+
+    db_close(g_dbConnection);
+
     return 0;
 }
