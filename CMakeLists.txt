@@ -26,7 +26,11 @@ else()
     message(FATAL_ERROR "libpqxx not found. Install it: sudo apt install libpqxx-dev")
 endif()
 
+find_package(CURL REQUIRED)
+include_directories(${CURL_INCLUDE_DIRS})
+
 include_directories(${INCLUDE_DIR})
+include_directories(${THIRD_PARTY_DIR}/stb)
 
 add_library(imgui STATIC
     ${THIRD_PARTY_DIR}/imgui/imgui.cpp
@@ -53,17 +57,25 @@ add_library(database STATIC ${SRC_DIR}/database.cpp)
 target_include_directories(database PUBLIC ${INCLUDE_DIR})
 target_link_libraries(database PRIVATE ${PostgreSQL_LIBRARIES} ${LIBPQXX_LIBRARY})
 
+add_library(map_utils STATIC ${SRC_DIR}/map_utils.cpp)
+target_include_directories(map_utils PUBLIC ${INCLUDE_DIR})
+target_link_libraries(map_utils PRIVATE ${CURL_LIBRARIES})
+
 add_executable(main
     ${SRC_DIR}/main.cpp
-    ${SRC_DIR}/database.cpp
+    ${SRC_DIR}/ui.cpp
+    ${SRC_DIR}/telemetry_server.cpp
 )
 target_link_libraries(main PRIVATE
     zmq
     imgui
     implot
+    database
+    map_utils
     ${SDL2_LIBRARIES}
     ${OPENGL_LIBRARIES}
     ${GLEW_LIBRARIES}
     ${PostgreSQL_LIBRARIES}
     ${LIBPQXX_LIBRARY}
+    ${CURL_LIBRARIES}
 )

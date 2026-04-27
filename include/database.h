@@ -14,6 +14,13 @@ struct DatabaseConnection {
     std::string password;
 };
 
+struct MapSignalPoint {
+    long long timestamp = 0;
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double signal = 0.0;
+};
+
 bool db_init(DatabaseConnection& db,
              const std::string& host = "localhost",
              const std::string& dbname = "telecom_db",
@@ -63,5 +70,8 @@ bool db_insert_cell(DatabaseConnection& db,
                     long long timing_advance_micros,
                     int bsic,
                     const std::string& nci);
+
+std::vector<MapSignalPoint> db_get_recent_map_points(DatabaseConnection& db,
+                                                     int limit = -1);
 
 #endif

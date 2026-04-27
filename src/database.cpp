@@ -1,5 +1,6 @@
 #include "database.h"
 #include <iostream>
+#include <limits>
 #include <mutex>
 
 static std::mutex g_dbMutex;
@@ -208,4 +209,48 @@ bool db_insert_cell(DatabaseConnection& db,
         std::cerr << "[DB] Ошибка при вставке cell: " << e.what() << std::endl;
         return false;
     }
+}
+
+std::vector<MapSignalPoint> db_get_recent_map_points(DatabaseConnection& db, int limit) {
+    std::vector<MapSignalPoint> points;
+    if (!db_is_connected(db)) {
+        return points;
+    }
+
+    std::lock_guard<std::mutex> lock(g_dbMutex);
+
+    try {
+        pqxx::work txn(*db.conn);
+        const std::string sql =
+            "SELECT lm.timestamp, lm.latitude, lm.longitude, "
+            "COALESCE( "
+            "MAX(CASE WHEN cm.rsrp < 0 THEN cm.rsrp END), "
+            "MAX(CASE WHEN cm.ss_rsrp < 0 THEN cm.ss_rsrp END), "
+            "MAX(CASE WHEN cm.rssi < 0 THEN cm.rssi END), "
+            "MAX(CASE WHEN cm.dbm < 0 THEN cm.dbm END) "
+            ") AS signal "
+            "FROM location_measurements lm "
+            "LEFT JOIN cell_measurements cm ON cm.location_id = lm.id "
+            "GROUP BY lm.id, lm.timestamp, lm.latitude, lm.longitude "
+            "ORDER BY lm.timestamp DESC";
+
+        const std::string sqlWithLimit = sql + " LIMIT $1";
+        pqxx::result r = limit > 0 ? txn.exec_params(sqlWithLimit, limit) : txn.exec(sql);
+        points.reserve(r.size());
+        for (const auto& row : r) {
+            MapSignalPoint point;
+            point.timestamp = row[0].as<long long>(0);
+            point.latitude = row[1].as<double>(0.0);
+            point.longitude = row[2].as<double>(0.0);
+            point.signal = row[3].is_null() ? std::numeric_limits<double>::quiet_NaN() : row[3].as<double>(0.0);
+            points.push_back(point);
+        }
+        txn.commit();
+    } catch (const pqxx::sql_error& e) {
+        std::cerr << "[DB] SQL error during map points fetch: " << e.what() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[DB] Error during map points fetch: " << e.what() << std::endl;
+    }
+
+    return points;
 }
